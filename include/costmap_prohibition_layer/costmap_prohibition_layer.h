@@ -126,6 +126,9 @@ private:
   void setPolygonCost(costmap_2d::Costmap2D &master_grid, const std::vector<geometry_msgs::Point>& polygon,
                       unsigned char cost, int min_i, int min_j, int max_i, int max_j, bool fill_polygon);
   
+  
+  bool isPointInPolygon(const std::vector<PointInt>& polygon, const PointInt& point);
+  
   /**
    * Convert polygon (in map coordinates) to a set of cells in the map
    * 
