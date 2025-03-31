@@ -194,7 +194,7 @@ namespace costmap_prohibition_layer_namespace
       for (int i = min_i; i < max_i; ++i)
       {
         unsigned char cost = cached_costmap_.getCost(i, j);
-        if (cost != costmap_2d::NO_INFORMATION)
+        if (cost == costmap_2d::LETHAL_OBSTACLE)
         {
           master_grid.setCost(i, j, cost);
         }
