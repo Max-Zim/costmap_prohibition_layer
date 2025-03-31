@@ -47,6 +47,9 @@
 #include <ros/ros.h>
 #include <costmap_2d/layer.h>
 #include <costmap_2d/layered_costmap.h>
+#include <costmap_2d/costmap_layer.h>
+#include <costmap_2d/layered_costmap.h>
+#include <costmap_2d/costmap_2d.h>
 #include <costmap_prohibition_layer/CostmapProhibitionLayerConfig.h>
 #include <dynamic_reconfigure/server.h>
 
@@ -97,6 +100,8 @@ public:
    */
   virtual void updateCosts(costmap_2d::Costmap2D& master_grid, int min_i, int min_j,
                            int max_i, int max_j);
+
+  virtual void matchSize();  
 
 private:
     
@@ -196,6 +201,10 @@ private:
   */
   bool getPoint(XmlRpc::XmlRpcValue& val, geometry_msgs::Point& point);
 
+  void rebuildCachedCostmap();
+  
+  costmap_2d::Costmap2D cached_costmap_;
+  bool needs_rebuild_;
   dynamic_reconfigure::Server<CostmapProhibitionLayerConfig>* _dsrv;            //!< dynamic_reconfigure server for the costmap
   std::mutex _data_mutex;                                                       //!< mutex for the accessing _prohibition_points and _prohibition_polygons
   double _costmap_resolution;                                                   //!< resolution of the overlayed costmap to create the thinnest line out of two points
