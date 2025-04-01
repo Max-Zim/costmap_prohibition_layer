@@ -39,6 +39,8 @@
 #include <costmap_prohibition_layer/costmap_prohibition_layer.h>
 #include <pluginlib/class_list_macros.h>
 #include <costmap_2d/cost_values.h>
+#include <tf2/convert.h>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.h>
 
 PLUGINLIB_EXPORT_CLASS(costmap_prohibition_layer_namespace::CostmapProhibitionLayer, costmap_2d::Layer)
 
@@ -60,7 +62,11 @@ namespace costmap_prohibition_layer_namespace
   void CostmapProhibitionLayer::onInitialize()
   {
     ros::NodeHandle nh("~/" + name_);
+    nh.param<std::string>("map_frame", map_frame_, "map");
+
     current_ = true;
+
+    global_frame_ = layered_costmap_->getGlobalFrameID();
 
     _dsrv = new dynamic_reconfigure::Server<CostmapProhibitionLayerConfig>(nh);
     dynamic_reconfigure::Server<CostmapProhibitionLayerConfig>::CallbackType cb =
@@ -99,13 +105,16 @@ namespace costmap_prohibition_layer_namespace
 
   void CostmapProhibitionLayer::matchSize()
   {
-    costmap_2d::Costmap2D *master = layered_costmap_->getCostmap();
-    cached_costmap_.resizeMap(master->getSizeInCellsX(),
-                              master->getSizeInCellsY(),
-                              master->getResolution(),
-                              master->getOriginX(),
-                              master->getOriginY());
-    needs_rebuild_ = true;
+    if (!layered_costmap_->isRolling())
+    {
+      costmap_2d::Costmap2D *master = layered_costmap_->getCostmap();
+      cached_costmap_.resizeMap(master->getSizeInCellsX(),
+                                master->getSizeInCellsY(),
+                                master->getResolution(),
+                                master->getOriginX(),
+                                master->getOriginY());
+      needs_rebuild_ = true;
+    }
   }
 
   void CostmapProhibitionLayer::rebuildCachedCostmap()
@@ -188,15 +197,54 @@ namespace costmap_prohibition_layer_namespace
   {
     if (!enabled_)
       return;
-
-    for (int j = min_j; j < max_j; ++j)
-    {
-      for (int i = min_i; i < max_i; ++i)
+    if (!layered_costmap_->isRolling()){
+      for (int j = min_j; j < max_j; ++j)
       {
-        unsigned char cost = cached_costmap_.getCost(i, j);
-        if (cost == costmap_2d::LETHAL_OBSTACLE)
+        for (int i = min_i; i < max_i; ++i)
         {
-          master_grid.setCost(i, j, cost);
+          unsigned char cost = cached_costmap_.getCost(i, j);
+          if (cost == costmap_2d::LETHAL_OBSTACLE)
+          {
+            master_grid.setCost(i, j, cost);
+          }
+        }
+      }
+    } 
+    else 
+    {
+      // If rolling window, the master_grid is unlikely to have same coordinates as this layer
+      unsigned int mx, my;
+      double wx, wy;
+      // Might even be in a different frame
+      geometry_msgs::TransformStamped transform;
+      try
+      {
+        transform = tf_->lookupTransform(map_frame_, global_frame_, ros::Time(0));
+      }
+      catch (tf2::TransformException ex)
+      {
+        ROS_ERROR("%s", ex.what());
+        return;
+      }
+      // Copy map data given proper transformations
+      tf2::Transform tf2_transform;
+      tf2::convert(transform.transform, tf2_transform);
+      
+      for (int j = min_j; j < max_j; ++j)
+      {
+        for (int i = min_i; i < max_i; ++i)
+        {
+          layered_costmap_->getCostmap()->mapToWorld(i, j, wx, wy);
+          tf2::Vector3 p(wx, wy, 0);
+          p = tf2_transform * p; 
+          
+          unsigned int mx_map, my_map;
+          if (cached_costmap_.worldToMap(p.x(), p.y(), mx_map, my_map)) {
+            unsigned char cost = cached_costmap_.getCost(mx_map, my_map);
+            if (cost == LETHAL_OBSTACLE) {
+              master_grid.setCost(i, j, cost);  // Mark original cell
+            }
+          }          
         }
       }
     }

@@ -48,7 +48,6 @@
 #include <costmap_2d/layer.h>
 #include <costmap_2d/layered_costmap.h>
 #include <costmap_2d/costmap_layer.h>
-#include <costmap_2d/layered_costmap.h>
 #include <costmap_2d/costmap_2d.h>
 #include <costmap_prohibition_layer/CostmapProhibitionLayerConfig.h>
 #include <dynamic_reconfigure/server.h>
@@ -203,6 +202,8 @@ private:
 
   void rebuildCachedCostmap();
   
+  std::string map_frame_;
+  std::string global_frame_;
   costmap_2d::Costmap2D cached_costmap_;
   bool needs_rebuild_;
   dynamic_reconfigure::Server<CostmapProhibitionLayerConfig>* _dsrv;            //!< dynamic_reconfigure server for the costmap
