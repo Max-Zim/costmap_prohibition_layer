@@ -340,7 +340,6 @@ namespace costmap_prohibition_layer_namespace
 
   void CostmapProhibitionLayer::rasterizePolygon(const std::vector<PointInt> &polygon, std::vector<PointInt> &polygon_cells, bool fill)
   {
-    ROS_WARN("Raserization of Polygon Triggered!");
     // this implementation is a slighly modified version of Costmap2D::convexFillCells(...)
 
     // we need a minimum polygon of a traingle
