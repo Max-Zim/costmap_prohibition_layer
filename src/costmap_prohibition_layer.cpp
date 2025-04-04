@@ -45,180 +45,270 @@ using costmap_2d::LETHAL_OBSTACLE;
 
 namespace costmap_prohibition_layer_namespace
 {
-    
-CostmapProhibitionLayer::CostmapProhibitionLayer() : _dsrv(NULL)
-{
-}
 
-CostmapProhibitionLayer::~CostmapProhibitionLayer()
-{
-    if (_dsrv!=NULL)
-        delete _dsrv;
-}
+  CostmapProhibitionLayer::CostmapProhibitionLayer() : _dsrv(NULL)
+  {
+  }
 
-void CostmapProhibitionLayer::onInitialize()
-{
-  ros::NodeHandle nh("~/" + name_);
-  current_ = true;
+  CostmapProhibitionLayer::~CostmapProhibitionLayer()
+  {
+    if (_dsrv != NULL)
+      delete _dsrv;
+  }
 
-  _dsrv = new dynamic_reconfigure::Server<CostmapProhibitionLayerConfig>(nh);
-  dynamic_reconfigure::Server<CostmapProhibitionLayerConfig>::CallbackType cb =
-      boost::bind(&CostmapProhibitionLayer::reconfigureCB, this, _1, _2);
-  _dsrv->setCallback(cb);
+  void CostmapProhibitionLayer::onInitialize()
+  {
+    ros::NodeHandle nh("~/" + name_);
+    current_ = true;
 
-  // get a pointer to the layered costmap and save resolution
-  costmap_2d::Costmap2D *costmap = layered_costmap_->getCostmap();
-  _costmap_resolution = costmap->getResolution();
+    _dsrv = new dynamic_reconfigure::Server<CostmapProhibitionLayerConfig>(nh);
+    dynamic_reconfigure::Server<CostmapProhibitionLayerConfig>::CallbackType cb =
+        boost::bind(&CostmapProhibitionLayer::reconfigureCB, this, _1, _2);
+    _dsrv->setCallback(cb);
 
-  // set initial bounds
-  _min_x = _min_y = _max_x = _max_y = 0;
-  
-  // reading the prohibition areas out of the namespace of this plugin!
-  // e.g.: "move_base/global_costmap/prohibition_layer/prohibition_areas"
-  std::string params = "prohibition_areas";
-  if (!parseProhibitionListFromYaml(&nh, params))
-    ROS_ERROR_STREAM("Reading prohibition areas from '" << nh.getNamespace() << "/" << params << "' failed!");
-  
-  _fill_polygons = true;
-  nh.param("fill_polygons", _fill_polygons, _fill_polygons);
-  
-  // compute map bounds for the current set of prohibition areas.
-  computeMapBounds();
-  
-  ROS_INFO("CostmapProhibitionLayer initialized.");
-}
+    // get a pointer to the layered costmap and save resolution
+    costmap_2d::Costmap2D *costmap = layered_costmap_->getCostmap();
+    _costmap_resolution = costmap->getResolution();
 
-void CostmapProhibitionLayer::reconfigureCB(CostmapProhibitionLayerConfig &config, uint32_t level)
-{
-  enabled_ = config.enabled;
-  _fill_polygons = config.fill_polygons;
-}
+    // set initial bounds
+    _min_x = _min_y = _max_x = _max_y = 0;
 
+    // reading the prohibition areas out of the namespace of this plugin!
+    // e.g.: "move_base/global_costmap/prohibition_layer/prohibition_areas"
+    std::string params = "prohibition_areas";
+    if (!parseProhibitionListFromYaml(&nh, params))
+      ROS_ERROR_STREAM("Reading prohibition areas from '" << nh.getNamespace() << "/" << params << "' failed!");
 
-void CostmapProhibitionLayer::updateBounds(double robot_x, double robot_y, double robot_yaw, 
-                                           double *min_x, double *min_y, double *max_x, double *max_y)
-{
+    _fill_polygons = true;
+    nh.param("fill_polygons", _fill_polygons, _fill_polygons);
+
+    // compute map bounds for the current set of prohibition areas.
+    computeMapBounds();
+
+    ROS_INFO("CostmapProhibitionLayer initialized.");
+  }
+
+  void CostmapProhibitionLayer::reconfigureCB(CostmapProhibitionLayerConfig &config, uint32_t level)
+  {
+    enabled_ = config.enabled;
+    if (_fill_polygons != config.fill_polygons)
+      _force_recompute = true;
+    _fill_polygons = config.fill_polygons;
+  }
+
+  void CostmapProhibitionLayer::updateBounds(double robot_x, double robot_y, double robot_yaw,
+                                             double *min_x, double *min_y, double *max_x, double *max_y)
+  {
     if (!enabled_)
-        return;
-    
+      return;
+
     std::lock_guard<std::mutex> l(_data_mutex);
-    
+
     if (_prohibition_points.empty() && _prohibition_polygons.empty())
-        return;
+      return;
 
     *min_x = std::min(*min_x, _min_x);
     *min_y = std::min(*min_y, _min_y);
     *max_x = std::max(*max_x, _max_x);
     *max_y = std::max(*max_y, _max_y);
-
-}
-
-void CostmapProhibitionLayer::updateCosts(costmap_2d::Costmap2D &master_grid, int min_i, int min_j, int max_i, int max_j)
-{
-  if (!enabled_)
-    return;
-
-  std::lock_guard<std::mutex> l(_data_mutex);
-  
-  // set costs of polygons
-  for (int i = 0; i < _prohibition_polygons.size(); ++i)
-  {
-      setPolygonCost(master_grid, _prohibition_polygons[i], LETHAL_OBSTACLE, min_i, min_j, max_i, max_j, _fill_polygons);
   }
-      
-  // set cost of points
-  for (int i = 0; i < _prohibition_points.size(); ++i)
+
+  void CostmapProhibitionLayer::updateCosts(costmap_2d::Costmap2D &master_grid, int min_i, int min_j, int max_i, int max_j)
   {
-    unsigned int mx;
-    unsigned int my;
-    if (master_grid.worldToMap(_prohibition_points[i].x, _prohibition_points[i].y, mx, my))
+    if (!enabled_)
+      return;
+
+    // check if origin or resolution of master grid has changed. if it has, costly computation is required
+    bool recompute_prohibited_cells = (_current_origin_x != master_grid.getOriginX() or
+                                       _current_origin_y != master_grid.getOriginY() or
+                                       _current_map_resolution != master_grid.getResolution() or
+                                       _force_recompute);
+
+    std::lock_guard<std::mutex> l(_data_mutex);
+
+    if (recompute_prohibited_cells)
     {
-      master_grid.setCost(mx, my, LETHAL_OBSTACLE);
+      // updateProhibitionCells(&master_grid, _prohibition_points, _prohibition_polygons, _prohibited_cells, _fill_polygons);
+      updateProhibitionCells(&master_grid, _prohibition_points, _prohibition_polygons, _prohibited_cells, min_i, min_j, max_i, max_j, _fill_polygons);
+      _force_recompute = false; // false because we have addressed it
+    }
+    // setCellCost(master_grid, _prohibited_cells, LETHAL_OBSTACLE, min_i, min_j, max_i, max_j);
+    setCellCost(master_grid, _prohibited_cells, LETHAL_OBSTACLE);
+  }
+
+  void CostmapProhibitionLayer::updateProhibitionCells(costmap_2d::Costmap2D *costmap_grid, const std::vector<geometry_msgs::Point> &prohibition_points,
+                                                       const std::vector<std::vector<geometry_msgs::Point>> &prohibition_polygons, std::vector<PointInt> &prohibited_cells, const bool &fill_polygons)
+  {
+    _current_origin_x = costmap_grid->getOriginX();
+    _current_origin_y = costmap_grid->getOriginY();
+    _current_map_resolution = costmap_grid->getResolution();
+
+    prohibited_cells.clear();
+    // set costs of polygons
+    for (int i = 0; i < prohibition_polygons.size(); ++i)
+    {
+      std::vector<PointInt> polygon_cells; // passing in polygon_cells instead of prohibited_cells so prohibited zones don't fuse together
+      updateProhibitedPolygon(costmap_grid, prohibition_polygons[i], polygon_cells, fill_polygons);
+      prohibited_cells.insert(prohibited_cells.end(), polygon_cells.begin(), polygon_cells.end()); // would usage of std::move be more efficient here?
+    }
+
+    // set cost of points
+    for (int i = 0; i < prohibition_points.size(); ++i)
+    {
+      updateProhibitedPoint(costmap_grid, prohibition_points[i], prohibited_cells);
     }
   }
-}
 
-void CostmapProhibitionLayer::computeMapBounds()
-{
-  std::lock_guard<std::mutex> l(_data_mutex);
-    
-  // reset bounds
-  _min_x = _min_y = _max_x = _max_y = 0;
-    
-  // iterate polygons
-  for (int i = 0; i < _prohibition_polygons.size(); ++i)
+  void CostmapProhibitionLayer::updateProhibitionCells(costmap_2d::Costmap2D *costmap_grid, const std::vector<geometry_msgs::Point> &prohibition_points,
+                                                       const std::vector<std::vector<geometry_msgs::Point>> &prohibition_polygons, std::vector<PointInt> &prohibited_cells,
+                                                       int min_i, int min_j, int max_i, int max_j, const bool &fill_polygons)
   {
-    for (int j=0; j < _prohibition_polygons.at(i).size(); ++j)
+    _current_origin_x = costmap_grid->getOriginX();
+    _current_origin_y = costmap_grid->getOriginY();
+    _current_map_resolution = costmap_grid->getResolution();
+
+    prohibited_cells.clear();
+
+    // get costs of polygons
+    for (int i = 0; i < prohibition_polygons.size(); ++i)
     {
-      double px = _prohibition_polygons.at(i).at(j).x;
-      double py = _prohibition_polygons.at(i).at(j).y;
-      _min_x = std::min(px, _min_x);
-      _min_y = std::min(py, _min_y);
-      _max_x = std::max(px, _max_x);
-      _max_y = std::max(py, _max_y);
+      std::vector<PointInt> polygon_cells; // passing in polygon_cells instead of prohibited_cells so prohibited zones don't fuse together
+      updateProhibitedPolygon(costmap_grid, prohibition_polygons[i], polygon_cells, fill_polygons);
+      // filter points that are not in
+      for (std::vector<PointInt>::iterator it = polygon_cells.begin(); it != polygon_cells.end(); ++it)
+      {
+        int mx = it->x;
+        int my = it->y;
+        // check if point is outside bounds
+        if (mx < min_i || mx >= max_i)
+          continue;
+        if (my < min_j || my >= max_j)
+          continue;
+        prohibited_cells.push_back(*it);
+      }
+    }
+
+    // get cost of points
+    std::vector<PointInt> point_cells;
+    for (int i = 0; i < prohibition_points.size(); ++i)
+    {
+      updateProhibitedPoint(costmap_grid, prohibition_points[i], point_cells);
+    }
+    // filter points that are not in
+    for (std::vector<PointInt>::iterator it = point_cells.begin(); it != point_cells.end(); ++it)
+    {
+      int mx = it->x;
+      int my = it->y;
+      // check if point is outside bounds
+      if (mx < min_i || mx >= max_i)
+        continue;
+      if (my < min_j || my >= max_j)
+        continue;
+      prohibited_cells.push_back(*it);
     }
   }
 
-  // iterate points
-  for (int i = 0; i < _prohibition_points.size(); ++i)
+  void CostmapProhibitionLayer::computeMapBounds()
   {
+    std::lock_guard<std::mutex> l(_data_mutex);
+
+    // reset bounds
+    _min_x = _min_y = _max_x = _max_y = 0;
+
+    // iterate polygons
+    for (int i = 0; i < _prohibition_polygons.size(); ++i)
+    {
+      for (int j = 0; j < _prohibition_polygons.at(i).size(); ++j)
+      {
+        double px = _prohibition_polygons.at(i).at(j).x;
+        double py = _prohibition_polygons.at(i).at(j).y;
+        _min_x = std::min(px, _min_x);
+        _min_y = std::min(py, _min_y);
+        _max_x = std::max(px, _max_x);
+        _max_y = std::max(py, _max_y);
+      }
+    }
+
+    // iterate points
+    for (int i = 0; i < _prohibition_points.size(); ++i)
+    {
       double px = _prohibition_points.at(i).x;
       double py = _prohibition_points.at(i).y;
       _min_x = std::min(px, _min_x);
       _min_y = std::min(py, _min_y);
       _max_x = std::max(px, _max_x);
       _max_y = std::max(py, _max_y);
-  }
-}
-
-
-void CostmapProhibitionLayer::setPolygonCost(costmap_2d::Costmap2D &master_grid, const std::vector<geometry_msgs::Point>& polygon, unsigned char cost,
-                                             int min_i, int min_j, int max_i, int max_j, bool fill_polygon)
-{
-    std::vector<PointInt> map_polygon;
-    for (unsigned int i = 0; i < polygon.size(); ++i)
-    {
-        PointInt loc;
-        master_grid.worldToMapNoBounds(polygon[i].x, polygon[i].y, loc.x, loc.y);
-        map_polygon.push_back(loc);
     }
+  }
 
-    std::vector<PointInt> polygon_cells;
+  void CostmapProhibitionLayer::updateProhibitedPoint(costmap_2d::Costmap2D *costmap_grid, const geometry_msgs::Point &prohibition_point, std::vector<PointInt> &point_cells)
+  {
+    unsigned int mx;
+    unsigned int my;
+    if (costmap_grid->worldToMap(prohibition_point.x, prohibition_point.y, mx, my))
+    {
+      PointInt pt;
+      pt.x = mx;                 // # INVESTIGATE: mx is unsigned int
+      pt.y = my;                 // # INVESTIGATE: my is unsigned int
+      point_cells.push_back(pt); // use emplace_back, do it!
+    }
+  }
+
+  void CostmapProhibitionLayer::updateProhibitedPolygon(costmap_2d::Costmap2D *costmap_grid, const std::vector<geometry_msgs::Point> &prohibition_polygon, std::vector<PointInt> &polygon_cells, const bool &fill_polygons)
+  {
+    std::vector<PointInt> map_polygon;
+    for (unsigned int i = 0; i < prohibition_polygon.size(); ++i)
+    {
+      PointInt loc;
+      costmap_grid->worldToMapNoBounds(prohibition_polygon[i].x, prohibition_polygon[i].y, loc.x, loc.y);
+      map_polygon.push_back(loc);
+    }
 
     // get the cells that fill the polygon
-    rasterizePolygon(map_polygon, polygon_cells, fill_polygon);
-
-    // set the cost of those cells
-    for (unsigned int i = 0; i < polygon_cells.size(); ++i)
-    {
-        int mx = polygon_cells[i].x;
-        int my = polygon_cells[i].y;
-        // check if point is outside bounds
-        if (mx < min_i || mx >= max_i)
-            continue;
-        if (my < min_j || my >= max_j)
-            continue;
-        master_grid.setCost(mx, my, cost);
-    }
-}
-
-
-void CostmapProhibitionLayer::polygonOutlineCells(const std::vector<PointInt>& polygon, std::vector<PointInt>& polygon_cells)
-  {
-     for (unsigned int i = 0; i < polygon.size() - 1; ++i)
-     {
-       raytrace(polygon[i].x, polygon[i].y, polygon[i + 1].x, polygon[i + 1].y, polygon_cells);
-     }
-     if (!polygon.empty())
-     {
-       unsigned int last_index = polygon.size() - 1;
-       // we also need to close the polygon by going from the last point to the first
-       raytrace(polygon[last_index].x, polygon[last_index].y, polygon[0].x, polygon[0].y, polygon_cells);
-     }
+    rasterizePolygon(map_polygon, polygon_cells, fill_polygons);
   }
 
-void CostmapProhibitionLayer::raytrace(int x0, int y0, int x1, int y1, std::vector<PointInt>& cells)
-{
+  void CostmapProhibitionLayer::setCellCost(costmap_2d::Costmap2D &master_grid, std::vector<PointInt> &prohibited_cells, unsigned char cost, int min_i, int min_j, int max_i, int max_j)
+  {
+    // set the cost of those cells
+    for (unsigned int i = 0; i < prohibited_cells.size(); ++i)
+    {
+      int mx = prohibited_cells[i].x;
+      int my = prohibited_cells[i].y;
+      // check if point is outside bounds
+      if (mx < min_i || mx >= max_i)
+        continue;
+      if (my < min_j || my >= max_j)
+        continue;
+      master_grid.setCost(mx, my, cost);
+    }
+  }
+
+  void CostmapProhibitionLayer::setCellCost(costmap_2d::Costmap2D &master_grid, std::vector<PointInt> &prohibited_cells, unsigned char cost)
+  {
+    // set the cost of those cells
+    for (unsigned int i = 0; i < prohibited_cells.size(); ++i)
+    {
+      master_grid.setCost(prohibited_cells[i].x, prohibited_cells[i].y, cost);
+    }
+  }
+
+  void CostmapProhibitionLayer::polygonOutlineCells(const std::vector<PointInt> &polygon, std::vector<PointInt> &polygon_cells)
+  {
+    for (unsigned int i = 0; i < polygon.size() - 1; ++i)
+    {
+      raytrace(polygon[i].x, polygon[i].y, polygon[i + 1].x, polygon[i + 1].y, polygon_cells);
+    }
+    if (!polygon.empty())
+    {
+      unsigned int last_index = polygon.size() - 1;
+      // we also need to close the polygon by going from the last point to the first
+      raytrace(polygon[last_index].x, polygon[last_index].y, polygon[0].x, polygon[0].y, polygon_cells);
+    }
+  }
+
+  void CostmapProhibitionLayer::raytrace(int x0, int y0, int x1, int y1, std::vector<PointInt> &cells)
+  {
     int dx = abs(x1 - x0);
     int dy = abs(y1 - y0);
     PointInt pt;
@@ -230,258 +320,261 @@ void CostmapProhibitionLayer::raytrace(int x0, int y0, int x1, int y1, std::vect
     int error = dx - dy;
     dx *= 2;
     dy *= 2;
-        
+
     for (; n > 0; --n)
     {
-        cells.push_back(pt);
+      cells.push_back(pt);
 
-        if (error > 0)
-        {
-            pt.x += x_inc;
-            error -= dy;
-        }
-        else
-        {
-            pt.y += y_inc;
-            error += dx;
-        }
+      if (error > 0)
+      {
+        pt.x += x_inc;
+        error -= dy;
+      }
+      else
+      {
+        pt.y += y_inc;
+        error += dx;
+      }
     }
-}
+  }
 
-bool CostmapProhibitionLayer::isPointInPolygon(const std::vector<PointInt>& polygon, const PointInt& point) {
-    bool odd = false;
-    int j = polygon.size() - 1;
-    for (size_t i = 0; i < polygon.size(); i++) {
-        if (((polygon[i].y > point.y) != (polygon[j].y > point.y)) &&
-            (point.x < ((polygon[j].x - polygon[i].x) * (point.y - polygon[i].y) / (polygon[j].y - polygon[i].y) + polygon[i].x))) {
-            odd = !odd;
-        }
-        j = i;
-    }
-    return odd;
-}
-
-void CostmapProhibitionLayer::rasterizePolygon(const std::vector<PointInt>& polygon, std::vector<PointInt>& polygon_cells, bool fill)
-{
+  void CostmapProhibitionLayer::rasterizePolygon(const std::vector<PointInt> &polygon, std::vector<PointInt> &polygon_cells, bool fill)
+  {
     // this implementation is a slighly modified version of Costmap2D::convexFillCells(...)
 
-    //we need a minimum polygon of a traingle
-    if(polygon.size() < 3)
-        return;
+    // we need a minimum polygon of a traingle
+    if (polygon.size() < 3)
+      return;
 
-    //first get the cells that make up the outline of the polygon
+    // first get the cells that make up the outline of the polygon
     polygonOutlineCells(polygon, polygon_cells);
 
     if (!fill)
-        return;
+      return;
 
-    //quick bubble sort to sort points by x
+    // quick bubble sort to sort points by x
     PointInt swap;
     unsigned int i = 0;
-    while(i < polygon_cells.size() - 1)
+    while (i < polygon_cells.size() - 1)
     {
-        if(polygon_cells[i].x > polygon_cells[i + 1].x)
-        {
-            swap = polygon_cells[i];
-            polygon_cells[i] = polygon_cells[i + 1];
-            polygon_cells[i + 1] = swap;
+      if (polygon_cells[i].x > polygon_cells[i + 1].x)
+      {
+        swap = polygon_cells[i];
+        polygon_cells[i] = polygon_cells[i + 1];
+        polygon_cells[i + 1] = swap;
 
-            if(i > 0)
-            --i;
-        }
-        else
-            ++i;
+        if (i > 0)
+          --i;
+      }
+      else
+        ++i;
     }
 
     i = 0;
     PointInt min_pt;
     PointInt max_pt;
     int min_x = polygon_cells[0].x;
-    int max_x = polygon_cells[(int)polygon_cells.size() -1].x;
+    int max_x = polygon_cells[(int)polygon_cells.size() - 1].x;
 
-    //walk through each column and mark cells inside the polygon
-    for(int x = min_x; x <= max_x; ++x)
+    // walk through each column and mark cells inside the polygon
+    for (int x = min_x; x <= max_x; ++x)
     {
-        if(i >= (int)polygon_cells.size() - 1)
-            break;
+      if (i >= (int)polygon_cells.size() - 1)
+        break;
 
-        if(polygon_cells[i].y < polygon_cells[i + 1].y)
-        {
-            min_pt = polygon_cells[i];
-            max_pt = polygon_cells[i + 1];
-        }
-        else
-        {
-            min_pt = polygon_cells[i + 1];
-            max_pt = polygon_cells[i];
-        }
-
-        i += 2;
-        while(i < polygon_cells.size() && polygon_cells[i].x == x)
-        {
-            if(polygon_cells[i].y < min_pt.y)
-                min_pt = polygon_cells[i];
-            else if(polygon_cells[i].y > max_pt.y)
-                max_pt = polygon_cells[i];
-            ++i;
-        }
-
-        PointInt pt;
-        //loop though cells in the column
-        for(int y = min_pt.y; y < max_pt.y; ++y)
-        {
-            pt.x = x;
-            pt.y = y;
-            if (isPointInPolygon(polygon, pt))
-                polygon_cells.push_back(pt);
-        }
-    }
-}
-
-// load prohibition positions out of the rosparam server
-bool CostmapProhibitionLayer::parseProhibitionListFromYaml(ros::NodeHandle *nhandle, const std::string &param)
-{
-  std::lock_guard<std::mutex> l(_data_mutex);
-  std::unordered_map<std::string, geometry_msgs::Pose> map_out;
-
-  XmlRpc::XmlRpcValue param_yaml;
-
-  bool ret_val = true;
-
-  if (nhandle->getParam(param, param_yaml))
-  {
-    if (param_yaml.getType() == XmlRpc::XmlRpcValue::TypeArray)  // list of goals
-    {
-      for (int i = 0; i < param_yaml.size(); ++i)
+      if (polygon_cells[i].y < polygon_cells[i + 1].y)
       {
-        if (param_yaml[i].getType() == XmlRpc::XmlRpcValue::TypeArray)
+        min_pt = polygon_cells[i];
+        max_pt = polygon_cells[i + 1];
+      }
+      else
+      {
+        min_pt = polygon_cells[i + 1];
+        max_pt = polygon_cells[i];
+      }
+
+      i += 2;
+      while (i < polygon_cells.size() && polygon_cells[i].x == x)
+      {
+        if (polygon_cells[i].y < min_pt.y)
+          min_pt = polygon_cells[i];
+        else if (polygon_cells[i].y > max_pt.y)
+          max_pt = polygon_cells[i];
+        ++i;
+      }
+
+      PointInt pt;
+      // loop though cells in the column
+      for (int y = min_pt.y; y < max_pt.y; ++y)
+      {
+        pt.x = x;
+        pt.y = y;
+        if (isPointInPolygon(polygon, pt))
+          polygon_cells.push_back(pt);
+      }
+    }
+  }
+
+  bool CostmapProhibitionLayer::isPointInPolygon(const std::vector<PointInt> &polygon, const PointInt &point)
+  {
+    bool odd = false;
+    int j = polygon.size() - 1;
+    for (size_t i = 0; i < polygon.size(); i++)
+    {
+      if (((polygon[i].y > point.y) != (polygon[j].y > point.y)) &&
+          (point.x < ((polygon[j].x - polygon[i].x) * (point.y - polygon[i].y) / (polygon[j].y - polygon[i].y) + polygon[i].x)))
+      {
+        odd = !odd;
+      }
+      j = i;
+    }
+    return odd;
+  }
+
+  // load prohibition positions out of the rosparam server
+  bool CostmapProhibitionLayer::parseProhibitionListFromYaml(ros::NodeHandle *nhandle, const std::string &param)
+  {
+    std::lock_guard<std::mutex> l(_data_mutex);
+    std::unordered_map<std::string, geometry_msgs::Pose> map_out;
+
+    XmlRpc::XmlRpcValue param_yaml;
+
+    bool ret_val = true;
+
+    if (nhandle->getParam(param, param_yaml))
+    {
+      if (param_yaml.getType() == XmlRpc::XmlRpcValue::TypeArray) // list of goals
+      {
+        for (int i = 0; i < param_yaml.size(); ++i)
         {
-          std::vector<geometry_msgs::Point> vector_to_add;
-
-          /* **************************************
-           * differ between points and polygons
-           * lines get to a polygon with the resolution
-           * of the costmap
-           **************************************** */
-
-          // add a point
-          if (param_yaml[i].size() == 1)
+          if (param_yaml[i].getType() == XmlRpc::XmlRpcValue::TypeArray)
           {
-            geometry_msgs::Point point;
-            ret_val = getPoint(param_yaml[i][0], point);
-            _prohibition_points.push_back(point);
-          }
-          // add a line
-          else if (param_yaml[i].size() == 2)
-          {
-            if (param_yaml[i][0].getType() == XmlRpc::XmlRpcValue::TypeDouble ||
-	      param_yaml[i][0].getType() == XmlRpc::XmlRpcValue::TypeInt)
+            std::vector<geometry_msgs::Point> vector_to_add;
+
+            /* **************************************
+             * differ between points and polygons
+             * lines get to a polygon with the resolution
+             * of the costmap
+             **************************************** */
+
+            // add a point
+            if (param_yaml[i].size() == 1)
             {
-              // add a lonely point
               geometry_msgs::Point point;
-              ret_val = getPoint(param_yaml[i], point);
+              ret_val = getPoint(param_yaml[i][0], point);
               _prohibition_points.push_back(point);
             }
-            else
+            // add a line
+            else if (param_yaml[i].size() == 2)
             {
-              // add a line!
-              geometry_msgs::Point point_A;
-              ret_val = getPoint(param_yaml[i][0], point_A);
-              vector_to_add.push_back(point_A);
+              if (param_yaml[i][0].getType() == XmlRpc::XmlRpcValue::TypeDouble ||
+                  param_yaml[i][0].getType() == XmlRpc::XmlRpcValue::TypeInt)
+              {
+                // add a lonely point
+                geometry_msgs::Point point;
+                ret_val = getPoint(param_yaml[i], point);
+                _prohibition_points.push_back(point);
+              }
+              else
+              {
+                // add a line!
+                geometry_msgs::Point point_A;
+                ret_val = getPoint(param_yaml[i][0], point_A);
+                vector_to_add.push_back(point_A);
 
-              geometry_msgs::Point point_B;
-              ret_val = getPoint(param_yaml[i][1], point_B);
-              vector_to_add.push_back(point_B);
+                geometry_msgs::Point point_B;
+                ret_val = getPoint(param_yaml[i][1], point_B);
+                vector_to_add.push_back(point_B);
 
-              // calculate the normal vector for AB
-              geometry_msgs::Point point_N;
-              point_N.x = point_B.y - point_A.y;
-              point_N.y = point_A.x - point_B.x;
+                // calculate the normal vector for AB
+                geometry_msgs::Point point_N;
+                point_N.x = point_B.y - point_A.y;
+                point_N.y = point_A.x - point_B.x;
 
-              // get the absolute value of N to normalize and get
-              // it to the length of the costmap resolution
-              double abs_N = sqrt(pow(point_N.x, 2) + pow(point_N.y, 2));
-              point_N.x = point_N.x / abs_N * _costmap_resolution;
-              point_N.y = point_N.y / abs_N * _costmap_resolution;
+                // get the absolute value of N to normalize and get
+                // it to the length of the costmap resolution
+                double abs_N = sqrt(pow(point_N.x, 2) + pow(point_N.y, 2));
+                point_N.x = point_N.x / abs_N * _costmap_resolution;
+                point_N.y = point_N.y / abs_N * _costmap_resolution;
 
-              // calculate the new points to get a polygon which can be filled
-              geometry_msgs::Point point;
-              point.x = point_A.x + point_N.x;
-              point.y = point_A.y + point_N.y;
-              vector_to_add.push_back(point);
+                // calculate the new points to get a polygon which can be filled
+                geometry_msgs::Point point;
+                point.x = point_A.x + point_N.x;
+                point.y = point_A.y + point_N.y;
+                vector_to_add.push_back(point);
 
-              point.x = point_B.x + point_N.x;
-              point.y = point_B.y + point_N.y;
-              vector_to_add.push_back(point);
+                point.x = point_B.x + point_N.x;
+                point.y = point_B.y + point_N.y;
+                vector_to_add.push_back(point);
 
+                _prohibition_polygons.push_back(vector_to_add);
+              }
+            }
+            // add a point or add a polygon
+            else if (param_yaml[i].size() >= 3)
+            {
+              // add a polygon with any number of points
+              for (int j = 0; j < param_yaml[i].size(); ++j)
+              {
+                geometry_msgs::Point point;
+                ret_val = getPoint(param_yaml[i][j], point);
+                vector_to_add.push_back(point);
+              }
               _prohibition_polygons.push_back(vector_to_add);
             }
           }
-          // add a point or add a polygon
-          else if (param_yaml[i].size() >= 3)
+          else
           {
-            // add a polygon with any number of points
-            for (int j = 0; j < param_yaml[i].size(); ++j)
-            {
-              geometry_msgs::Point point;
-              ret_val = getPoint(param_yaml[i][j], point);
-              vector_to_add.push_back(point);
-            }
-            _prohibition_polygons.push_back(vector_to_add);
+            ROS_ERROR_STREAM("Prohibition Layer:" << param << " with index " << i << " is not correct.");
+            ret_val = false;
           }
         }
-        else
-        {
-          ROS_ERROR_STREAM("Prohibition Layer:" << param << " with index " << i << " is not correct.");
-          ret_val = false;
-        }
+      }
+      else
+      {
+        ROS_ERROR_STREAM("Prohibition Layer: " << param << "struct is not correct.");
+        ret_val = false;
       }
     }
     else
     {
-      ROS_ERROR_STREAM("Prohibition Layer: " << param << "struct is not correct.");
+      ROS_ERROR_STREAM("Prohibition Layer: Cannot read " << param << " from parameter server");
       ret_val = false;
     }
+    return ret_val;
   }
-  else
-  {
-    ROS_ERROR_STREAM("Prohibition Layer: Cannot read " << param << " from parameter server");
-    ret_val = false;
-  }
-  return ret_val;
-}
 
-// get a point out of the XML Type into a geometry_msgs::Point
-bool CostmapProhibitionLayer::getPoint(XmlRpc::XmlRpcValue &val, geometry_msgs::Point &point)
-{
-  try
+  // get a point out of the XML Type into a geometry_msgs::Point
+  bool CostmapProhibitionLayer::getPoint(XmlRpc::XmlRpcValue &val, geometry_msgs::Point &point)
   {
-    // check if there a two values for the coordinate
-    if (val.getType() == XmlRpc::XmlRpcValue::TypeArray && val.size() == 2)
+    try
     {
-      auto convDouble = [](XmlRpc::XmlRpcValue &val) -> double
+      // check if there a two values for the coordinate
+      if (val.getType() == XmlRpc::XmlRpcValue::TypeArray && val.size() == 2)
       {
-        if (val.getType() == XmlRpc::XmlRpcValue::TypeInt)  // XmlRpc cannot cast int to double
-          return int(val);
-        return val;  // if not double, an exception is thrown;
-      };
+        auto convDouble = [](XmlRpc::XmlRpcValue &val) -> double
+        {
+          if (val.getType() == XmlRpc::XmlRpcValue::TypeInt) // XmlRpc cannot cast int to double
+            return int(val);
+          return val; // if not double, an exception is thrown;
+        };
 
-      point.x = convDouble(val[0]);
-      point.y = convDouble(val[1]);
-      point.z = 0.0;
-      return true;
+        point.x = convDouble(val[0]);
+        point.y = convDouble(val[1]);
+        point.z = 0.0;
+        return true;
+      }
+      else
+      {
+        ROS_ERROR_STREAM("Prohibition_Layer: A point has to consist two values!");
+        return false;
+      }
     }
-    else
+    catch (const XmlRpc::XmlRpcException &ex)
     {
-      ROS_ERROR_STREAM("Prohibition_Layer: A point has to consist two values!");
+      ROS_ERROR_STREAM("Prohibition Layer: Cannot add current point: " << ex.getMessage());
       return false;
     }
   }
-  catch (const XmlRpc::XmlRpcException &ex)
-  {
-    ROS_ERROR_STREAM("Prohibition Layer: Cannot add current point: " << ex.getMessage());
-    return false;
-  }
-}
 
-}  // end namespace
+} // end namespace
